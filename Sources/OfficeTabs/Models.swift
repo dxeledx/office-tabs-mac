@@ -49,8 +49,12 @@ struct OfficeDocument: Identifiable {
     let fileURL: URL?
     let isEdited: Bool
     let isMinimized: Bool
+    /// 必须读取 AXFullScreen，普通贴边最大化不能通过窗口尺寸推断为全屏。
+    let isFullScreen: Bool
     /// 系统辅助功能以主屏左上角为原点；面板定位时统一转换为 AppKit 坐标。
     let frame: CGRect
+    /// 几何采样开始的单调时钟时间，用于拒绝较慢的完整扫描带来的过期位置。
+    let geometryTimestamp: TimeInterval
     let element: AXUIElement
 }
 

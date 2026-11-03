@@ -21,24 +21,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var permissionTimer: Timer?
     private var orderedIDs: [String] = []
     private var lastActiveID: String?
-    private var lastLayoutRequest: [String: Date] = [:]
+    private struct GeometrySnapshot {
+        let frame: CGRect
+        let timestamp: TimeInterval
+    }
+    private var geometry: [String: GeometrySnapshot] = [:]
+    private var geometryChangedAt: [String: TimeInterval] = [:]
+    private var isInteracting = false
+    private var interactionEndedAt: TimeInterval = 0
+    private var interactionStartedAt: TimeInterval = 0
+    private var interactionGeometryUpdates = 0
+    private var pendingReservation: DispatchWorkItem?
+    private var pendingReservationID: String?
+    private var pendingReservationFrame: CGRect?
+    private var reservationsInFlight: Set<String> = []
+    private var reservationFailures: [String: (frame: CGRect, count: Int)] = [:]
+    private var lastReservationAttempt: [String: TimeInterval] = [:]
+    private var interactionGeneration: UInt64 = 0
     private var errorMessage: String?
     private var foregroundObserver: NSObjectProtocol?
     private var screenObserver: NSObjectProtocol?
     private var visibilityReason = ""
     private let logger = Logger(subsystem: "local.jason.OfficeTabs", category: "window-state")
+    private var cachedHidden = UserDefaults.standard.bool(forKey: "barHidden")
+    private var cachedReserve = UserDefaults.standard.object(forKey: "reserveSpace") as? Bool ?? true
+    private var cachedFollow = UserDefaults.standard.object(forKey: "followsWindow") as? Bool ?? true
 
     private var isHidden: Bool {
-        get { defaults.bool(forKey: "barHidden") }
-        set { defaults.set(newValue, forKey: "barHidden") }
+        get { cachedHidden }
+        set { cachedHidden = newValue; defaults.set(newValue, forKey: "barHidden") }
     }
     private var reserveSpace: Bool {
-        get { defaults.object(forKey: "reserveSpace") as? Bool ?? true }
-        set { defaults.set(newValue, forKey: "reserveSpace") }
+        get { cachedReserve }
+        set { cachedReserve = newValue; defaults.set(newValue, forKey: "reserveSpace") }
     }
     private var followsWindow: Bool {
-        get { defaults.object(forKey: "followsWindow") as? Bool ?? true }
-        set { defaults.set(newValue, forKey: "followsWindow") }
+        get { cachedFollow }
+        set { cachedFollow = newValue; defaults.set(newValue, forKey: "followsWindow") }
     }
     private var filter: OfficeApp? {
         get { defaults.string(forKey: "appFilter").flatMap(OfficeApp.init(rawValue:)) }
@@ -55,10 +74,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         createPanel()
         createStatusItem()
         foregroundObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
-                                                                               object: nil, queue: .main) { [weak self] _ in self?.updateBar() }
+                                                                               object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            self.interactionGeneration &+= 1
+            self.reservationFailures.removeAll()
+            self.updateBar()
+        }
         screenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                                 object: nil, queue: .main) { [weak self] _ in self?.updateBar() }
         monitor.onChange = { [weak self] snapshot in self?.receive(snapshot) }
+        monitor.onGeometryChange = { [weak self] id, frame, down, timestamp in
+            self?.receiveGeometry(id: id, frame: frame, mouseDown: down, timestamp: timestamp)
+        }
+        monitor.onInteractionChange = { [weak self] down in
+            guard let self else { return }
+            self.recordInteraction(down)
+            if let document = self.currentDocument(), self.followsWindow { self.layoutAttached(document) }
+        }
         monitor.onError = { [weak self] message in
             self?.errorMessage = message
             self?.statusItem.button?.toolTip = "Office Tabs：\(message)"
@@ -69,6 +101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         permissionTimer?.invalidate()
+        cancelReservation()
         monitor.stop()
         panel.orderOut(nil)
         if let foregroundObserver { NSWorkspace.shared.notificationCenter.removeObserver(foregroundObserver) }
@@ -173,7 +206,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let existing = Set(snapshot.documents.map(\.id))
         orderedIDs.removeAll { !existing.contains($0) }
         for document in snapshot.documents where !orderedIDs.contains(document.id) { orderedIDs.append(document.id) }
-        lastLayoutRequest = lastLayoutRequest.filter { existing.contains($0.key) }
+        for document in snapshot.documents {
+            recordGeometry(id: document.id, frame: document.frame, timestamp: document.geometryTimestamp)
+        }
+        geometry = geometry.filter { existing.contains($0.key) }
+        geometryChangedAt = geometryChangedAt.filter { existing.contains($0.key) }
+        reservationFailures = reservationFailures.filter { existing.contains($0.key) }
+        lastReservationAttempt = lastReservationAttempt.filter { existing.contains($0.key) }
         if snapshot.accessibilityGranted { errorMessage = nil }
         setupStatus?.stringValue = snapshot.accessibilityGranted ? "已获得辅助功能权限，可以使用标签切换。" : "尚未授权。请在系统设置中启用 Office Tabs。"
         statusItem.button?.toolTip = snapshot.accessibilityGranted ? "Office Tabs · \(snapshot.documents.count) 个文档" : "Office Tabs · 需要辅助功能权限"
@@ -188,21 +227,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // AX 扫描可能在 Office 忙碌时变慢，显示前以最新前台应用再次核实可见性。
         let currentFrontBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let frontOffice = OfficeApp.matching(currentFrontBundle)
-        let preferredID = state.activeDocumentID ?? lastActiveID
-        // 应用切换通知先于 AX 焦点回调到达；过渡期间只采用当前 Office 的文档和位置。
-        let currentDocuments = state.documents.filter { $0.app == frontOffice && !$0.isMinimized }
-        let currentDocument = currentDocuments.first { $0.id == preferredID } ?? currentDocuments.first
-        bar.update(documents: sortedDocuments(), activeID: currentDocument?.id ?? lastActiveID,
+        let selectedDocument = currentDocument()
+        bar.update(documents: sortedDocuments(), activeID: selectedDocument?.id ?? lastActiveID,
                    filter: filter, themeApp: frontOffice)
-        if !state.accessibilityGranted { hidePanel("permission"); return }
-        if isHidden { hidePanel("user-hidden"); return }
-        if state.hasModalWindow { hidePanel("office-dialog"); return }
-        if state.documents.isEmpty { hidePanel("no-documents"); return }
-        if frontOffice == nil { hidePanel("other-app"); return }
-        guard let document = currentDocument else { hidePanel("no-current-document"); return }
+        guard canPresent() else { return }
+        guard let document = selectedDocument else { hidePanel("no-current-document"); return }
         if followsWindow {
-            guard let frame = panelFrame(for: document) else { hidePanel("invalid-frame"); return }
-            panel.setFrame(frame, display: true)
+            layoutAttached(document)
+            return
         } else if !panel.isVisible {
             let savedX = defaults.object(forKey: "manualX") as? Double
             let savedY = defaults.object(forKey: "manualY") as? Double
@@ -214,21 +246,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let width = min(1100, visible.width - 16)
             let x = max(visible.minX, min(savedX ?? visible.midX - width / 2, visible.maxX - width))
             let y = max(visible.minY, min(savedY ?? visible.maxY - 50, visible.maxY - 44))
-            panel.setFrame(NSRect(x: x, y: y, width: width, height: 44), display: true)
+            panel.setFrame(NSRect(x: x, y: y, width: width, height: WindowPlacement.height), display: false)
         }
-        panel.orderFrontRegardless()
-        if visibilityReason != "visible" {
-            // 只记录可见性原因，不记录文档名称或路径，便于定位权限和弹窗造成的隐藏。
-            logger.notice("visibility: visible, documents: \(self.state.documents.count)")
-            visibilityReason = "visible"
-        }
+        showPanel()
         if !followsWindow {
             defaults.set(panel.frame.minX, forKey: "manualX")
             defaults.set(panel.frame.minY, forKey: "manualY")
         }
     }
 
+    private func currentDocument() -> OfficeDocument? {
+        let frontOffice = OfficeApp.matching(NSWorkspace.shared.frontmostApplication?.bundleIdentifier)
+        let preferredID = state.activeDocumentID ?? lastActiveID
+        let candidates = state.documents.filter { $0.app == frontOffice && !$0.isMinimized }
+        return candidates.first { $0.id == preferredID } ?? candidates.first
+    }
+
+    private func canPresent() -> Bool {
+        if !state.accessibilityGranted { hidePanel("permission"); return false }
+        if isHidden { hidePanel("user-hidden"); return false }
+        if state.hasModalWindow { hidePanel("office-dialog"); return false }
+        if state.documents.isEmpty { hidePanel("no-documents"); return false }
+        if OfficeApp.matching(NSWorkspace.shared.frontmostApplication?.bundleIdentifier) == nil {
+            hidePanel("other-app"); return false
+        }
+        return true
+    }
+
+    @discardableResult
+    private func recordGeometry(id: String, frame: CGRect, timestamp: TimeInterval) -> Bool {
+        if let known = geometry[id], known.timestamp > timestamp { return false }
+        if geometry[id]?.frame != frame {
+            geometryChangedAt[id] = ProcessInfo.processInfo.systemUptime
+            reservationFailures.removeValue(forKey: id)
+            if isInteracting { interactionGeometryUpdates += 1 }
+        }
+        geometry[id] = GeometrySnapshot(frame: frame, timestamp: timestamp)
+        return true
+    }
+
+    private func receiveGeometry(id: String, frame: CGRect, mouseDown: Bool, timestamp: TimeInterval) {
+        guard let document = state.documents.first(where: { $0.id == id }),
+              recordGeometry(id: id, frame: frame, timestamp: timestamp) else { return }
+        recordInteraction(mouseDown)
+        guard followsWindow, canPresent(),
+              document.app == OfficeApp.matching(NSWorkspace.shared.frontmostApplication?.bundleIdentifier) else { return }
+        if state.activeDocumentID != id {
+            state.activeDocumentID = id
+            lastActiveID = id
+            updateBar()
+        } else {
+            // 拖动只更新面板几何，不刷新标签控件、状态菜单或偏好设置。
+            layoutAttached(document)
+        }
+    }
+
+    private func showPanel() {
+        if !panel.isVisible { panel.orderFrontRegardless() }
+        if visibilityReason != "visible" {
+            // 只记录可见性原因，不记录文档名称或路径，便于定位权限和弹窗造成的隐藏。
+            logger.notice("visibility: visible, documents: \(self.state.documents.count)")
+            visibilityReason = "visible"
+        }
+    }
+
+    private func recordInteraction(_ down: Bool) {
+        guard down != isInteracting else { return }
+        isInteracting = down
+        if down {
+            interactionStartedAt = ProcessInfo.processInfo.systemUptime
+            interactionGeometryUpdates = 0
+            interactionGeneration &+= 1
+            reservationFailures.removeAll()
+            cancelReservation()
+        } else {
+            interactionEndedAt = ProcessInfo.processInfo.systemUptime
+            if interactionGeometryUpdates > 0, interactionEndedAt - interactionStartedAt > 0.05 {
+                logger.notice("geometry tracking: \(self.interactionGeometryUpdates) updates in \(Int((self.interactionEndedAt - self.interactionStartedAt) * 1000)) ms")
+            }
+        }
+    }
+
     private func hidePanel(_ reason: String) {
+        if reason != "awaiting-space" { cancelReservation() }
         if visibilityReason != reason {
             logger.notice("visibility: \(reason, privacy: .public), documents: \(self.state.documents.count)")
             visibilityReason = reason
@@ -236,47 +336,104 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if panel.isVisible { panel.orderOut(nil) }
     }
 
-    private func panelFrame(for document: OfficeDocument) -> NSRect? {
+    private func layoutAttached(_ document: OfficeDocument) {
+        guard canPresent() else { return }
         let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
-        let frame = NSRect(x: document.frame.minX, y: primaryTop - document.frame.maxY,
-                           width: document.frame.width, height: document.frame.height)
-        guard frame.width > 100, frame.height > 100 else { return nil }
+        let axFrame = geometry[document.id]?.frame ?? document.frame
+        let frame = NSRect(x: axFrame.minX, y: primaryTop - axFrame.maxY,
+                           width: axFrame.width, height: axFrame.height)
         let screen = NSScreen.screens.max { a, b in
             a.frame.intersection(frame).area < b.frame.intersection(frame).area
         } ?? NSScreen.main
-        guard let screen else { return nil }
-        let visible = screen.visibleFrame
-        let height: CGFloat = 44
-        let width = max(380, min(frame.width, visible.width))
-        let x = min(max(frame.minX, visible.minX), visible.maxX - width)
-        let isFullScreen = abs(frame.minY - screen.frame.minY) < 3 && abs(frame.height - screen.frame.height) < 3
-        if isFullScreen {
-            // 全屏窗口交由系统管理几何信息，标签栏作为辅助面板展示，绝不改写其大小。
-            return NSRect(x: x, y: visible.maxY - height - 4, width: width, height: height)
-        }
-        let desiredTop = frame.maxY + height + 5
-        if desiredTop > visible.maxY + 1, reserveSpace {
-            let last = lastLayoutRequest[document.id] ?? .distantPast
-            if Date().timeIntervalSince(last) > 2 {
-                lastLayoutRequest[document.id] = Date()
-                monitor.reserveTopSpace(document.id, height: height + 5)
+        guard let screen else { hidePanel("invalid-frame"); return }
+        switch WindowPlacement.attached(to: frame, visible: screen.visibleFrame, isFullScreen: document.isFullScreen) {
+        case .above(let target):
+            cancelReservation()
+            // 单纯移动交给窗口合成器处理；尺寸不变时无需强制布局或同步重绘整个标签栏。
+            if abs(panel.frame.width - target.width) > 0.25 || abs(panel.frame.height - target.height) > 0.25 {
+                panel.setFrame(target, display: false)
+            } else if abs(panel.frame.minX - target.minX) > 0.25 || abs(panel.frame.minY - target.minY) > 0.25 {
+                panel.setFrameOrigin(target.origin)
             }
-            // AX 调整可能被 Office 拒绝；失败后保留可用的顶部浮栏，不持续隐藏。
-            return NSRect(x: x, y: visible.maxY - height, width: width, height: height)
+            if visibilityReason != "visible" {
+                logger.notice("attached layout: clearance \(target.minY - frame.maxY) pt, screen margin \(screen.visibleFrame.maxY - target.maxY) pt")
+            }
+            showPanel()
+        case .needsSpace:
+            hidePanel("awaiting-space")
+            scheduleReservation(document, observedFrame: axFrame)
+        case .unavailable:
+            hidePanel(document.isFullScreen ? "full-screen" : "invalid-frame")
         }
-        return NSRect(x: x, y: min(frame.maxY + 5, visible.maxY - height), width: width, height: height)
+    }
+
+    private func cancelReservation() {
+        pendingReservation?.cancel()
+        pendingReservation = nil
+        pendingReservationID = nil
+        pendingReservationFrame = nil
+    }
+
+    private func scheduleReservation(_ document: OfficeDocument, observedFrame: CGRect) {
+        guard reserveSpace, !isInteracting, NSEvent.pressedMouseButtons & 1 == 0,
+              !document.isFullScreen, !reservationsInFlight.contains(document.id) else { cancelReservation(); return }
+        if let failure = reservationFailures[document.id], failure.frame == observedFrame, failure.count >= 3 {
+            cancelReservation()
+            return
+        }
+        if pendingReservationID == document.id, pendingReservationFrame == observedFrame { return }
+        cancelReservation()
+        let now = ProcessInfo.processInfo.systemUptime
+        // 等待松开鼠标并让系统贴边动画结束；拖动中绝不与 macOS 争抢 Office 窗口大小。
+        let settledAt = max(geometryChangedAt[document.id] ?? now, interactionEndedAt) + 0.18
+        let retryAt = (lastReservationAttempt[document.id] ?? -.infinity) + 0.8
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingReservation = nil
+            self.pendingReservationID = nil
+            self.pendingReservationFrame = nil
+            guard self.followsWindow, self.reserveSpace, self.canPresent(),
+                  !self.isInteracting, NSEvent.pressedMouseButtons & 1 == 0,
+                  self.currentDocument()?.id == document.id,
+                  self.geometry[document.id]?.frame == observedFrame else { return }
+            self.reservationsInFlight.insert(document.id)
+            self.lastReservationAttempt[document.id] = ProcessInfo.processInfo.systemUptime
+            let generation = self.interactionGeneration
+            self.monitor.reserveTopSpace(document.id, height: WindowPlacement.reservedHeight) { [weak self] success in
+                guard let self else { return }
+                self.reservationsInFlight.remove(document.id)
+                self.logger.notice("header reservation completed: \(success)")
+                // 新一轮拖动或应用切换会使旧请求失效，不能用它的失败结果阻断后续布局。
+                if generation == self.interactionGeneration, self.geometry[document.id]?.frame == observedFrame {
+                    if success {
+                        self.reservationFailures.removeValue(forKey: document.id)
+                    } else {
+                        let previous = self.reservationFailures[document.id]
+                        let count = previous?.frame == observedFrame ? (previous?.count ?? 0) + 1 : 1
+                        self.reservationFailures[document.id] = (observedFrame, count)
+                    }
+                }
+                // 即使设置操作成功，也必须等待实际读回的位置满足布局约束才重新显示。
+                self.monitor.refresh()
+                self.updateBar()
+            }
+        }
+        pendingReservation = work
+        pendingReservationID = document.id
+        pendingReservationFrame = observedFrame
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, max(settledAt, retryAt) - now), execute: work)
     }
 
     @objc private func toggleHidden() { isHidden.toggle(); updateBar() }
-    @objc private func toggleFollow() { followsWindow.toggle(); updateBar() }
-    @objc private func toggleReserve() { reserveSpace.toggle(); updateBar() }
+    @objc private func toggleFollow() { interactionGeneration &+= 1; followsWindow.toggle(); updateBar() }
+    @objc private func toggleReserve() { interactionGeneration &+= 1; reserveSpace.toggle(); reservationFailures.removeAll(); updateBar() }
     @objc private func resetPosition() {
         followsWindow = true
         defaults.removeObject(forKey: "manualX")
         defaults.removeObject(forKey: "manualY")
         updateBar()
     }
-    @objc private func refresh() { monitor.refresh() }
+    @objc private func refresh() { reservationFailures.removeAll(); monitor.refresh() }
     @objc private func quit() { NSApp.terminate(nil) }
     @objc private func selectDocument(_ sender: NSMenuItem) {
         if let id = sender.representedObject as? String { monitor.activate(id) }
@@ -306,7 +463,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func showAbout() {
         let alert = NSAlert()
-        alert.messageText = "Office Tabs 0.1.0"
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.1"
+        alert.messageText = "Office Tabs \(version)"
         alert.informativeText = "为 Word、Excel 和 PowerPoint 提供文档标签切换。\n\n本机运行 · Swift / AppKit · MIT 许可\n通过 macOS 辅助功能读取窗口标题、路径和状态。"
         alert.addButton(withTitle: "好")
         NSApp.activate(ignoringOtherApps: true)
