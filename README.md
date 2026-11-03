@@ -4,6 +4,8 @@ macOS 原生 Office 文档标签栏。将已打开的 Word、Excel 和 PowerPoin
 
 ## 构建与安装
 
+可从 [GitHub Releases](https://github.com/dxeledx/office-tabs-mac/releases/tag/v0.1.0) 下载 Apple Silicon 安装包和 SHA-256 校验文件。解压后将 `Office Tabs.app` 放入“应用程序”。安装包采用本地签名，尚未经过 Apple 公证；也可以从源码构建。
+
 需要 macOS 13 或更新版本，以及 Xcode Command Line Tools。构建脚本生成当前 Mac 架构的应用；本机已构建并验证的安装包为 Apple Silicon（ARM64）版本。Intel Mac 可在本机从源码构建。
 
 ```bash
