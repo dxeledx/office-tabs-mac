@@ -55,6 +55,8 @@ struct OfficeDocument: Identifiable {
     let frame: CGRect
     /// 几何采样开始的单调时钟时间，用于拒绝较慢的完整扫描带来的过期位置。
     let geometryTimestamp: TimeInterval
+    /// 确认文档身份后绑定系统窗口编号，拖动时直接读取 WindowServer 几何信息。
+    let windowServerID: CGWindowID?
     let element: AXUIElement
 }
 

@@ -43,7 +43,7 @@
 
 ## 开发
 
-使用 Swift 和 AppKit 构建，通过 macOS Accessibility API 跟踪和控制 Office 窗口。
+使用 Swift 和 AppKit 构建，通过 macOS Accessibility API 识别和控制 Office 窗口。拖动时按屏幕刷新节奏处理鼠标位移，通过 WindowServer 校准窗口位置。
 
 安装 Xcode Command Line Tools，使用 Swift 5.9 或更新版本：
 
@@ -67,6 +67,10 @@ cd office-tabs-mac
 Sources/OfficeTabs/
   AppDelegate.swift          应用生命周期与标签栏布局
   OfficeWindowMonitor.swift 窗口发现、事件监听与几何采样
+  WindowServerGeometry.swift 系统窗口编号绑定与位置读取
+  DisplayFrameClock.swift    屏幕同步更新时钟
+  CursorDragModel.swift      标题栏拖动与鼠标位移跟随
+  TitlebarDragRegions.swift  标题栏空白区域识别
   TabBarView.swift           标签栏界面与交互
   WindowPlacement.swift     窗口布局计算
 scripts/

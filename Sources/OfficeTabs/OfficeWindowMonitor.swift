@@ -8,6 +8,8 @@ final class OfficeWindowMonitor {
     var onError: ((String) -> Void)?
     var onGeometryChange: ((String, CGRect, Bool, TimeInterval) -> Void)?
     var onInteractionChange: ((Bool) -> Void)?
+    var onDragFrame: ((String, CGRect?) -> Void)?
+    var onFocusedDocumentChange: ((String) -> Void)?
 
     private struct RunningOffice {
         let kind: OfficeApp
@@ -32,12 +34,14 @@ final class OfficeWindowMonitor {
 
     private let queue = DispatchQueue(label: "local.officetabs.accessibility", qos: .userInitiated)
     private let geometryQueue = DispatchQueue(label: "local.officetabs.geometry", qos: .userInteractive)
+    private let focusQueue = DispatchQueue(label: "local.officetabs.focus", qos: .userInitiated)
+    private let frameClock = DisplayFrameClock()
     private var timer: Timer?
-    private var geometryTimer: Timer?
     private var globalMouseMonitor: Any?
     private var localMouseMonitor: Any?
     private var metadataRefreshWork: DispatchWorkItem?
     private var workspaceObservers: [NSObjectProtocol] = []
+    private var screenObserver: NSObjectProtocol?
     private var started = false
     private var scanning = false
     private var needsRefresh = false
@@ -48,13 +52,71 @@ final class OfficeWindowMonitor {
     private var interactionDown = false
     private var settleUntil: TimeInterval = 0
     private var geometryInFlight = false
+    private var focusResolutionInFlight = false
+    private var lastFocusResolutionAt: TimeInterval = 0
+    private var foregroundOfficePID: pid_t?
+    private var samplingScreen: NSScreen?
+    private struct ServerSnapshot {
+        let windows: [WindowServerWindow]
+        let timestamp: TimeInterval
+    }
+    private struct ScanResult {
+        let state: OfficeState
+        let serverSnapshots: [pid_t: ServerSnapshot]
+        let titlebarHints: [String: TitlebarHint]
+    }
+    private struct TitlebarHint {
+        let width: CGFloat
+        let title: String
+        let regions: [CGRect]
+        let timestamp: TimeInterval
+    }
+    private var serverSnapshots: [pid_t: ServerSnapshot] = [:]
+    private var titlebarHints: [String: TitlebarHint] = [:]
+    private var metadataTitlebarHints: [String: TitlebarHint] = [:]
+    private struct GeometryTarget {
+        let documentID: String
+        let processID: pid_t
+        let windowID: CGWindowID
+    }
+    private var dragTarget: GeometryTarget?
+    private var pointerDownAt: TimeInterval = 0
+    private struct CursorDrag {
+        let target: GeometryTarget
+        let generation: UInt64
+        var model: CursorDragModel
+    }
+    private var cursorDrag: CursorDrag?
+    private var latestPointer: CGPoint?
+    private var queryCursorMin: CGPoint?
+    private var queryCursorMax: CGPoint?
+    private var pointerGeneration: UInt64 = 0
+    private var lastPaintedFrame: CGRect?
+    private var dragRelease: (id: String, windowID: CGWindowID, timestamp: TimeInterval)?
+    private var nextValidationAt: TimeInterval = 0
+    private var lastPointerEventAt: TimeInterval = 0
+    private var lastButtonStateCheckAt: TimeInterval = 0
+    private var needsDragSizeValidation = false
+    private var releasedVisual: (target: GeometryTarget, frame: CGRect)?
+    private struct SamplingStats {
+        let startedAt: TimeInterval
+        var samples = 0
+        var changes = 0
+        var totalReadTime: TimeInterval = 0
+        var longestReadTime: TimeInterval = 0
+        var displayTicks = 0
+        var paintedFrames = 0
+        var lastTickAt: TimeInterval?
+        var longestTickGap: TimeInterval = 0
+    }
+    private var samplingStats: SamplingStats?
     private var focusRevision: UInt64 = 0
     private var geometryFrames: [String: (frame: CGRect, timestamp: TimeInterval)] = [:]
     private var lastFocusedSample: (id: String, processID: pid_t, timestamp: TimeInterval)?
     private let geometryLogger = Logger(subsystem: "local.jason.OfficeTabs", category: "geometry")
     private var lastReservationDiagnostic: String?
 
-    // 高频采样拥有独立 AX 引用和连接超时，不能覆盖全量扫描正在使用的窗口引用。
+    // AX 焦点只在切换文档、绑定窗口编号时读取，不能进入逐帧几何采样路径。
     private var geometryApplication: (processID: pid_t, element: AXUIElement)?
 
     // 以下缓存只由 queue 访问；AX 对象身份与标题无关，另存为同名文件仍保留各自标签。
@@ -87,6 +149,7 @@ final class OfficeWindowMonitor {
         guard !started else { return }
         started = true
         sessionID = UUID()
+        updateForegroundContext()
         let center = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didActivateApplicationNotification,
                      NSWorkspace.didLaunchApplicationNotification,
@@ -97,6 +160,8 @@ final class OfficeWindowMonitor {
             workspaceObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 guard let self else { return }
                 self.focusRevision &+= 1
+                self.updateForegroundContext()
+                self.dragTarget = nil
                 self.extendGeometryBurst()
                 self.refresh()
             })
@@ -107,13 +172,21 @@ final class OfficeWindowMonitor {
             // 移动时不重复扫描全部窗口；释放鼠标后的合并扫描负责同步名称和状态。
             if !self.interactionDown { self.refresh() }
         }
-        // 只观察鼠标按下/释放来启动短时采样，不监听键盘，也不在空闲时保持 60Hz 唤醒。
-        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { [weak self] _ in
-            self?.pointerInteractionEvent()
+        // 鼠标手势启动屏幕同步采样，空闲时停止；拖动事件本身不执行 AX 查询。
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged]) { [weak self] event in
+            self?.pointerInteractionEvent(event)
         }
-        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { [weak self] event in
-            self?.pointerInteractionEvent()
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged]) { [weak self] event in
+            self?.pointerInteractionEvent(event)
             return event
+        }
+        screenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                                                object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            // 热插拔或刷新率改变后重建显示时钟，避免继续等待已移除屏幕的回调。
+            self.frameClock.stop()
+            self.samplingScreen = nil
+            self.extendGeometryBurst()
         }
         refresh()
     }
@@ -127,16 +200,22 @@ final class OfficeWindowMonitor {
         sessionID = UUID()
         timer?.invalidate()
         timer = nil
-        geometryTimer?.invalidate()
-        geometryTimer = nil
+        stopGeometryClock()
         if let globalMouseMonitor { NSEvent.removeMonitor(globalMouseMonitor) }
         if let localMouseMonitor { NSEvent.removeMonitor(localMouseMonitor) }
         globalMouseMonitor = nil
         localMouseMonitor = nil
+        if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
+        screenObserver = nil
         metadataRefreshWork?.cancel()
         metadataRefreshWork = nil
         geometryInFlight = false
+        focusResolutionInFlight = false
+        dragTarget = nil
         geometryFrames.removeAll()
+        clearDragVisual()
+        serverSnapshots.removeAll()
+        titlebarHints.removeAll()
         lastFocusedSample = nil
         if interactionDown { onInteractionChange?(false) }
         interactionDown = false
@@ -156,6 +235,7 @@ final class OfficeWindowMonitor {
             return
         }
         let frontmost = NSWorkspace.shared.frontmostApplication
+        updateForegroundContext()
         guard AXIsProcessTrusted() else {
             documents = []
             accessibilityGranted = false
@@ -173,15 +253,17 @@ final class OfficeWindowMonitor {
         let frontmostPID = frontmost?.processIdentifier
         let currentSession = sessionID
         let scanStartedAt = ProcessInfo.processInfo.systemUptime
+        let cachedServerSnapshots = serverSnapshots
         scanning = true
         queue.async { [weak self] in
             guard let self = self else { return }
-            let result = self.scan(running, frontmostPID: frontmostPID, frontmostBundleID: frontmostBundleID)
+            let result = self.scan(running, frontmostPID: frontmostPID, frontmostBundleID: frontmostBundleID,
+                                   cachedServerSnapshots: cachedServerSnapshots)
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 self.scanning = false
                 guard self.started, self.sessionID == currentSession else { return }
-                var published = result
+                var published = result.state
                 self.accessibilityGranted = published.accessibilityGranted
                 let currentFrontmost = NSWorkspace.shared.frontmostApplication
                 if currentFrontmost?.processIdentifier != frontmostPID {
@@ -193,6 +275,7 @@ final class OfficeWindowMonitor {
                 }
                 // 低频扫描完成时，保留采样线程已读到的更新位置，防止标签栏向旧位置回跳。
                 let liveIDs = Set(published.documents.map(\.id))
+                self.titlebarHints = result.titlebarHints.filter { liveIDs.contains($0.key) }
                 self.geometryFrames = self.geometryFrames.filter { liveIDs.contains($0.key) }
                 published.documents = published.documents.map { document in
                     guard let latest = self.geometryFrames[document.id], latest.timestamp >= document.geometryTimestamp else { return document }
@@ -201,6 +284,36 @@ final class OfficeWindowMonitor {
                 if let latest = self.lastFocusedSample, latest.timestamp >= scanStartedAt,
                    latest.processID == currentFrontmost?.processIdentifier, liveIDs.contains(latest.id) {
                     published.activeDocumentID = latest.id
+                }
+                if self.interactionDown, let pinned = self.dragTarget,
+                   pinned.processID == currentFrontmost?.processIdentifier, liveIDs.contains(pinned.documentID) {
+                    published.activeDocumentID = pinned.documentID
+                }
+                // 主线程刚确认的窗口编号优先于更早启动的元数据扫描，且绑定始终一一对应。
+                let currentByID = Dictionary(uniqueKeysWithValues: self.documents.map { ($0.id, $0) })
+                let bindingCandidates = published.documents.map { document in
+                    let previous = currentByID[document.id]
+                    let known = previous?.processID == document.processID ? previous?.windowServerID : nil
+                    return WindowServerDocument(id: document.id, processID: document.processID, frame: document.frame,
+                                                previousWindowID: known ?? document.windowServerID)
+                }
+                for (pid, snapshot) in result.serverSnapshots {
+                    if snapshot.timestamp >= (self.serverSnapshots[pid]?.timestamp ?? 0) { self.serverSnapshots[pid] = snapshot }
+                }
+                let pids = Set(published.documents.map(\.processID))
+                self.serverSnapshots = self.serverSnapshots.filter { pids.contains($0.key) }
+                let serverWindows = pids.flatMap { self.serverSnapshots[$0]?.windows ?? [] }
+                let bindings = WindowServerGeometry.bindings(documents: bindingCandidates, candidates: serverWindows,
+                                                             focusedDocumentID: published.activeDocumentID)
+                published.documents = published.documents.map { Self.binding($0, to: bindings[$0.id]) }
+                let trackingID = self.cursorDrag?.target.documentID ?? self.dragRelease?.id
+                if let trackingID {
+                    let trackingWindowID = self.cursorDrag?.target.windowID ?? self.dragRelease?.windowID
+                    let tracked = published.documents.first { $0.id == trackingID && !$0.isMinimized }
+                    if tracked == nil || tracked?.windowServerID != trackingWindowID ||
+                        (!self.interactionDown && published.activeDocumentID != trackingID) {
+                        self.clearDragVisual()
+                    }
                 }
                 self.documents = published.documents
                 self.activeDocumentID = published.activeDocumentID
@@ -213,19 +326,174 @@ final class OfficeWindowMonitor {
         }
     }
 
-    private func extendGeometryBurst() {
-        settleUntil = max(settleUntil, ProcessInfo.processInfo.systemUptime + 0.35)
-        guard geometryTimer == nil, started, accessibilityGranted,
-              OfficeApp.matching(NSWorkspace.shared.frontmostApplication?.bundleIdentifier) != nil else { return }
-        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.geometryTick() }
-        RunLoop.main.add(timer, forMode: .common)
-        geometryTimer = timer
+    private func updateForegroundContext() {
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        let nextPID = OfficeApp.matching(frontmost?.bundleIdentifier) == nil ? nil : frontmost?.processIdentifier
+        if foregroundOfficePID != nextPID {
+            clearDragVisual()
+            dragTarget = nil
+            foregroundOfficePID = nextPID
+            setInteraction(false)
+            stopGeometryClock()
+        }
     }
 
-    private func pointerInteractionEvent() {
+    private func extendGeometryBurst() {
+        settleUntil = max(settleUntil, ProcessInfo.processInfo.systemUptime + 0.35)
+        guard started, accessibilityGranted, foregroundOfficePID != nil else { return }
+        if !frameClock.isRunning { updateSamplingScreen() }
+    }
+
+    private func updateSamplingScreen(frame: CGRect? = nil) {
+        let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
+        let active = documents.first(where: { $0.id == activeDocumentID })
+        let axFrame = frame ?? active.flatMap { geometryFrames[$0.id]?.frame ?? $0.frame }
+        let appKitFrame = axFrame.map { CGRect(x: $0.minX, y: primaryTop - $0.maxY, width: $0.width, height: $0.height) }
+        let screen = appKitFrame.flatMap { rect in
+            NSScreen.screens.max { $0.frame.intersection(rect).area < $1.frame.intersection(rect).area }
+        } ?? NSScreen.main ?? NSScreen.screens.first
+        guard let screen else { return }
+        if samplingStats == nil { samplingStats = SamplingStats(startedAt: ProcessInfo.processInfo.systemUptime) }
+        samplingScreen = screen
+        frameClock.start(on: screen) { [weak self] in self?.geometryTick() }
+    }
+
+    private func stopGeometryClock() {
+        frameClock.stop()
+        if let stats = samplingStats, stats.samples > 0 || stats.paintedFrames > 0 {
+            let elapsed = max(0.001, ProcessInfo.processInfo.systemUptime - stats.startedAt)
+            let averageMS = stats.totalReadTime * 1000 / Double(max(1, stats.samples))
+            geometryLogger.notice("window-server tracking: \(stats.samples) samples, \(stats.changes) changes in \(Int(elapsed * 1000)) ms; read avg \(averageMS) ms, max \(stats.longestReadTime * 1000) ms; display \(self.samplingScreen?.maximumFramesPerSecond ?? 0) Hz, ticks \(stats.displayTicks), cursor paints \(stats.paintedFrames), max tick gap \(stats.longestTickGap * 1000) ms")
+        }
+        samplingStats = nil
+        samplingScreen = nil
+    }
+
+    private func pointerInteractionEvent(_ event: NSEvent) {
         guard started else { return }
-        extendGeometryBurst()
-        geometryTick()
+        lastPointerEventAt = ProcessInfo.processInfo.systemUptime
+        if let point = event.cgEvent?.location {
+            latestPointer = point
+            extendQueryCursorRange(point)
+        }
+        if event.type == .leftMouseUp {
+            endPointerInteraction()
+            extendGeometryBurst()
+            scheduleMetadataRefresh()
+        } else if foregroundOfficePID != nil {
+            if !interactionDown {
+                let provisional = releasedVisual
+                clearDragVisual(notify: provisional == nil)
+                pointerDownAt = ProcessInfo.processInfo.systemUptime
+                pointerGeneration &+= 1
+                setInteraction(true)
+                pinWindowUnderPointer(event, provisional: provisional)
+                if let provisional {
+                    if cursorDrag?.target.windowID == provisional.target.windowID {
+                        lastPaintedFrame = provisional.frame
+                    } else {
+                        onDragFrame?(provisional.target.documentID, nil)
+                    }
+                }
+            }
+            extendGeometryBurst()
+        }
+    }
+
+    private func setInteraction(_ down: Bool) {
+        guard interactionDown != down else { return }
+        interactionDown = down
+        onInteractionChange?(down)
+        if !down { scheduleMetadataRefresh() }
+    }
+
+    private func pinWindowUnderPointer(_ event: NSEvent, provisional: (target: GeometryTarget, frame: CGRect)? = nil) {
+        guard let pid = foregroundOfficePID else { return }
+        guard let point = latestPointer else { return }
+        let eventID = event.cgEvent?.getIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent) ?? 0
+        let fallbackID = event.cgEvent?.getIntegerValueField(.mouseEventWindowUnderMousePointer) ?? 0
+        let suppliedID = eventID > 0 ? eventID : fallbackID
+        let cached = serverSnapshots[pid]?.windows ?? []
+        let windowID: CGWindowID?
+        if suppliedID > 0, suppliedID <= Int64(UInt32.max) {
+            windowID = CGWindowID(suppliedID)
+        } else {
+            windowID = cached.first(where: { $0.frame.contains(point) })?.id
+        }
+        guard let windowID else { return }
+        let matches = documents.filter { $0.processID == pid && $0.windowServerID == windowID }
+        guard matches.count == 1, let document = matches.first else {
+            requestFocusResolution(processID: pid)
+            return
+        }
+        // 一次拖动固定绑定窗口编号，冗余焦点通知不会中断已经确认的跟随目标。
+        let target = GeometryTarget(documentID: document.id, processID: pid, windowID: windowID)
+        dragTarget = target
+        if activeDocumentID != document.id {
+            activeDocumentID = document.id
+            lastFocusedSample = (document.id, pid, ProcessInfo.processInfo.systemUptime)
+            onFocusedDocumentChange?(document.id)
+        }
+        let frame = provisional?.target.windowID == windowID ? provisional!.frame : (geometryFrames[document.id]?.frame ?? document.frame)
+        let hint = titlebarHints[document.id]
+        let trusted = hint.map { abs($0.width - frame.width) <= 1 && TitlebarDragRegions.contains(cursor: point, windowFrame: frame, regions: $0.regions) } ?? false
+        if let model = CursorDragModel(frame: frame, cursor: point, allowsImmediateTracking: trusted) {
+            cursorDrag = CursorDrag(target: target, generation: pointerGeneration, model: model)
+        }
+        geometryLogger.notice("drag titlebar: trusted \(trusted), regions \(hint?.regions.count ?? 0)")
+        needsDragSizeValidation = false
+        nextValidationAt = 0
+    }
+
+    private func extendQueryCursorRange(_ point: CGPoint) {
+        guard geometryInFlight else { return }
+        if let low = queryCursorMin, let high = queryCursorMax {
+            queryCursorMin = CGPoint(x: min(low.x, point.x), y: min(low.y, point.y))
+            queryCursorMax = CGPoint(x: max(high.x, point.x), y: max(high.y, point.y))
+        } else {
+            queryCursorMin = point
+            queryCursorMax = point
+        }
+    }
+
+    private func paintCursorFrame() {
+        guard interactionDown, var drag = cursorDrag, let pointer = latestPointer else { return }
+        drag.model.advance(cursor: pointer)
+        cursorDrag = drag
+        guard
+              let frame = drag.model.predictedFrame(cursor: pointer), frame != lastPaintedFrame else { return }
+        lastPaintedFrame = frame
+        samplingStats?.paintedFrames += 1
+        onDragFrame?(drag.target.documentID, frame)
+    }
+
+    private func endPointerInteraction() {
+        if let drag = cursorDrag {
+            paintCursorFrame()
+            if lastPaintedFrame != nil {
+                dragRelease = (drag.target.documentID, drag.target.windowID, ProcessInfo.processInfo.systemUptime)
+                if let frame = lastPaintedFrame, let point = latestPointer, let screen = samplingScreen {
+                    let top = NSScreen.screens.first?.frame.maxY ?? 0
+                    let appKitPoint = CGPoint(x: point.x, y: top - point.y)
+                    if screen.visibleFrame.insetBy(dx: 24, dy: 24).contains(appKitPoint) {
+                        releasedVisual = (drag.target, frame)
+                    }
+                }
+            }
+        }
+        cursorDrag = nil
+        setInteraction(false)
+        dragTarget = nil
+        nextValidationAt = 0
+    }
+
+    private func clearDragVisual(notify: Bool = true) {
+        let id = cursorDrag?.target.documentID ?? dragRelease?.id
+        cursorDrag = nil
+        dragRelease = nil
+        lastPaintedFrame = nil
+        releasedVisual = nil
+        if notify, let id { onDragFrame?(id, nil) }
     }
 
     private func scheduleMetadataRefresh() {
@@ -248,47 +516,125 @@ final class OfficeWindowMonitor {
 
     private func geometryTick() {
         guard started, accessibilityGranted else {
-            geometryTimer?.invalidate()
-            geometryTimer = nil
+            stopGeometryClock()
             return
         }
-        let mouseDown = NSEvent.pressedMouseButtons & 1 != 0
         let now = ProcessInfo.processInfo.systemUptime
-        // 空闲时只读取鼠标按钮快照，不发送 AX 请求，也不反复查询所有运行中的应用。
-        guard mouseDown || interactionDown || now < settleUntil else {
-            geometryTimer?.invalidate()
-            geometryTimer = nil
+        if interactionDown, now - lastPointerEventAt > 0.12, now - lastButtonStateCheckAt > 0.12 {
+            lastButtonStateCheckAt = now
+            if NSEvent.pressedMouseButtons & 1 == 0 { endPointerInteraction() }
+            settleUntil = max(settleUntil, now + 0.35)
+        }
+        guard let processID = foregroundOfficePID, interactionDown || dragRelease != nil || now < settleUntil else {
+            stopGeometryClock()
             return
         }
-        let frontmost = NSWorkspace.shared.frontmostApplication
-        let isOfficeFront = OfficeApp.matching(frontmost?.bundleIdentifier) != nil
-        let down = mouseDown && isOfficeFront
-        if down != interactionDown {
-            interactionDown = down
-            onInteractionChange?(down)
-            if !down {
-                extendGeometryBurst()
-                scheduleMetadataRefresh()
-            }
+        if var stats = samplingStats {
+            stats.displayTicks += 1
+            if let last = stats.lastTickAt { stats.longestTickGap = max(stats.longestTickGap, now - last) }
+            stats.lastTickAt = now
+            samplingStats = stats
         }
-        guard isOfficeFront else {
-            geometryTimer?.invalidate()
-            geometryTimer = nil
-            return
+        // 绘制只读取鼠标事件缓存；系统查询变慢时，标题栏的视觉帧仍继续更新。
+        paintCursorFrame()
+        if cursorDrag?.model.isConfirmed == true {
+            if !needsDragSizeValidation || now < nextValidationAt { return }
         }
-        guard let processID = frontmost?.processIdentifier,
-              mouseDown || now < settleUntil else { return }
         requestGeometrySample(processID: processID)
     }
 
     private func requestGeometrySample(processID: pid_t) {
         guard !geometryInFlight else { return }
+        let target: GeometryTarget?
+        if let pinned = dragTarget, pinned.processID == processID {
+            target = pinned
+        } else if let document = documents.first(where: { $0.id == activeDocumentID && $0.processID == processID && !$0.isMinimized }),
+                  let windowID = document.windowServerID {
+            target = GeometryTarget(documentID: document.id, processID: processID, windowID: windowID)
+        } else {
+            target = nil
+        }
+        guard let target else { requestFocusResolution(processID: processID); return }
+        let currentSession = sessionID
+        let generation = pointerGeneration
+        queryCursorMin = latestPointer
+        queryCursorMax = latestPointer
+        geometryInFlight = true
+        needsDragSizeValidation = false
+        nextValidationAt = ProcessInfo.processInfo.systemUptime + (cursorDrag?.model.isConfirmed == true ? 0.125 : 0)
+        geometryQueue.async { [weak self] in
+            let sampledAt = ProcessInfo.processInfo.systemUptime
+            // WindowServer 直接提供窗口位置，逐帧路径完全不等待 Office 的 AX 消息处理。
+            let frame = WindowServerGeometry.frame(windowID: target.windowID, processID: target.processID)
+            let readTime = ProcessInfo.processInfo.systemUptime - sampledAt
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.started, self.sessionID == currentSession else { return }
+                self.geometryInFlight = false
+                let cursorLow = self.queryCursorMin
+                let cursorHigh = self.queryCursorMax
+                self.queryCursorMin = nil
+                self.queryCursorMax = nil
+                guard self.foregroundOfficePID == processID,
+                      self.documents.contains(where: { $0.id == target.documentID && $0.windowServerID == target.windowID && !$0.isMinimized }) else {
+                    if self.cursorDrag?.target.documentID == target.documentID || self.dragRelease?.id == target.documentID {
+                        self.clearDragVisual()
+                    }
+                    return
+                }
+                guard let frame else {
+                    if self.dragTarget?.windowID == target.windowID { self.dragTarget = nil }
+                    if self.cursorDrag?.target.documentID == target.documentID || self.dragRelease?.id == target.documentID {
+                        self.clearDragVisual()
+                    }
+                    self.requestFocusResolution(processID: processID)
+                    return
+                }
+                guard self.dragTarget?.windowID == target.windowID || self.activeDocumentID == target.documentID else { return }
+                let previous = self.geometryFrames[target.documentID]
+                let focusChanged = self.activeDocumentID != target.documentID
+                let changed = previous?.frame != frame || focusChanged
+                if var stats = self.samplingStats {
+                    stats.samples += 1
+                    stats.totalReadTime += readTime
+                    stats.longestReadTime = max(stats.longestReadTime, readTime)
+                    if changed { stats.changes += 1 }
+                    self.samplingStats = stats
+                }
+                var cancelPrediction = false
+                if var drag = self.cursorDrag, drag.generation == generation,
+                   drag.target.documentID == target.documentID, let low = cursorLow, let high = cursorHigh {
+                    drag.model.observe(frame: frame, cursorRange: CGRect(x: low.x, y: low.y,
+                                                                        width: high.x - low.x, height: high.y - low.y))
+                    self.cursorDrag = drag
+                    cancelPrediction = !drag.model.isValid
+                }
+                self.deliverGeometry(id: target.documentID, processID: processID, frame: frame, timestamp: sampledAt)
+                if cancelPrediction {
+                    self.clearDragVisual()
+                } else if let release = self.dragRelease, release.id == target.documentID, sampledAt >= release.timestamp {
+                    // 只有松手后开始读取的实际位置，才能收回视觉覆盖并继续最大化布局。
+                    self.clearDragVisual()
+                }
+                if let screen = self.samplingScreen {
+                    let top = NSScreen.screens.first?.frame.maxY ?? 0
+                    let center = CGPoint(x: frame.midX, y: top - frame.midY)
+                    if !screen.frame.contains(center) { self.updateSamplingScreen(frame: frame) }
+                }
+            }
+        }
+    }
+
+    private func requestFocusResolution(processID: pid_t) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard !focusResolutionInFlight, now - lastFocusResolutionAt > 0.15 else { return }
+        if interactionDown, dragTarget != nil { return }
         let candidates = documents.filter { $0.processID == processID && !$0.isMinimized }
         guard !candidates.isEmpty else { return }
         let currentSession = sessionID
-        let currentFocusRevision = focusRevision
-        geometryInFlight = true
-        geometryQueue.async { [weak self] in
+        let revision = focusRevision
+        focusResolutionInFlight = true
+        lastFocusResolutionAt = now
+        focusQueue.async { [weak self] in
             guard let self else { return }
             let application: AXUIElement
             if let cached = self.geometryApplication, cached.processID == processID {
@@ -298,32 +644,48 @@ final class OfficeWindowMonitor {
                 AXUIElementSetMessagingTimeout(application, 0.035)
                 self.geometryApplication = (processID, application)
             }
-            // 焦点窗口引用只供几何线程使用，避免与全量扫描的 AX 超时设置互相干扰。
             let focused = Self.element(application, kAXFocusedWindowAttribute as CFString)
             let target = focused.flatMap { focused in candidates.first { CFEqual($0.element, focused) } }
             if let focused { AXUIElementSetMessagingTimeout(focused, 0.035) }
             let sampledAt = ProcessInfo.processInfo.systemUptime
             let sampledFrame = target == nil ? nil : focused.flatMap { Self.frame($0) }
+            let serverReadAt = ProcessInfo.processInfo.systemUptime
+            let serverWindows = WindowServerGeometry.list(processID: processID)
+            let windowID = target.flatMap { document in
+                if let known = document.windowServerID, serverWindows.contains(where: { $0.id == known }) { return known }
+                return sampledFrame.flatMap { WindowServerGeometry.match(frame: $0, candidates: serverWindows, allowFrontmost: true) }
+            }
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.started, self.sessionID == currentSession else { return }
-                self.geometryInFlight = false
-                guard self.focusRevision == currentFocusRevision,
-                      NSWorkspace.shared.frontmostApplication?.processIdentifier == processID,
+                self.focusResolutionInFlight = false
+                guard self.focusRevision == revision, self.foregroundOfficePID == processID,
                       let target, self.documents.contains(where: { $0.id == target.id }),
                       let frame = sampledFrame, frame.width > 0, frame.height > 0 else { return }
-                let previous = self.geometryFrames[target.id]
-                let focusChanged = self.activeDocumentID != target.id
-                self.geometryFrames[target.id] = (frame, sampledAt)
-                self.lastFocusedSample = (target.id, processID, sampledAt)
-                self.activeDocumentID = target.id
+                if self.interactionDown, let pinned = self.dragTarget, pinned.documentID != target.id { return }
+                if !self.interactionDown, let release = self.dragRelease, release.id != target.id { self.clearDragVisual() }
+                if serverReadAt >= (self.serverSnapshots[processID]?.timestamp ?? 0) {
+                    self.serverSnapshots[processID] = ServerSnapshot(windows: serverWindows, timestamp: serverReadAt)
+                }
                 self.documents = self.documents.map { document in
-                    document.id == target.id ? Self.replacingFrame(document, with: frame, timestamp: sampledAt) : document
+                    if document.id == target.id { return Self.binding(document, to: windowID) }
+                    // 焦点已由 AX 确认，清除与其编号冲突的旧绑定，不能让两个标签跟随同一个窗口。
+                    if let windowID, document.windowServerID == windowID { return Self.binding(document, to: nil) }
+                    return document
                 }
-                if previous?.frame != frame || focusChanged {
-                    self.onGeometryChange?(target.id, frame, NSEvent.pressedMouseButtons & 1 != 0, sampledAt)
-                }
+                self.deliverGeometry(id: target.id, processID: processID, frame: frame, timestamp: sampledAt)
             }
         }
+    }
+
+    private func deliverGeometry(id: String, processID: pid_t, frame: CGRect, timestamp: TimeInterval) {
+        let previous = geometryFrames[id]
+        guard previous == nil || timestamp >= previous!.timestamp else { return }
+        let changed = previous?.frame != frame || activeDocumentID != id
+        geometryFrames[id] = (frame, timestamp)
+        lastFocusedSample = (id, processID, timestamp)
+        activeDocumentID = id
+        // 元数据只在低频扫描时发布；拖动帧只写几何缓存，避免为每帧重建文档数组。
+        if changed { onGeometryChange?(id, frame, interactionDown, timestamp) }
     }
 
     private func handleNotification(_ name: CFString) {
@@ -333,13 +695,17 @@ final class OfficeWindowMonitor {
         }
         guard started else { return }
         if name as String == kAXWindowMovedNotification as String || name as String == kAXWindowResizedNotification as String {
+            if name as String == kAXWindowResizedNotification as String { needsDragSizeValidation = true }
             extendGeometryBurst()
             geometryTick()
             scheduleMetadataRefresh()
         } else {
             if name as String == kAXFocusedWindowChangedNotification as String || name as String == kAXMainWindowChangedNotification as String {
                 focusRevision &+= 1
+                if !interactionDown { dragTarget = nil }
                 extendGeometryBurst()
+                if let pid = foregroundOfficePID { requestFocusResolution(processID: pid) }
+                if interactionDown { return }
             }
             refresh()
         }
@@ -349,7 +715,16 @@ final class OfficeWindowMonitor {
         OfficeDocument(id: document.id, app: document.app, processID: document.processID,
                        title: document.title, fileURL: document.fileURL, isEdited: document.isEdited,
                        isMinimized: document.isMinimized, isFullScreen: document.isFullScreen,
-                       frame: frame, geometryTimestamp: timestamp, element: document.element)
+                       frame: frame, geometryTimestamp: timestamp,
+                       windowServerID: document.windowServerID, element: document.element)
+    }
+
+    private static func binding(_ document: OfficeDocument, to windowID: CGWindowID?) -> OfficeDocument {
+        OfficeDocument(id: document.id, app: document.app, processID: document.processID,
+                       title: document.title, fileURL: document.fileURL, isEdited: document.isEdited,
+                       isMinimized: document.isMinimized, isFullScreen: document.isFullScreen,
+                       frame: document.frame, geometryTimestamp: document.geometryTimestamp,
+                       windowServerID: windowID, element: document.element)
     }
 
     func activate(_ id: String) {
@@ -546,7 +921,8 @@ final class OfficeWindowMonitor {
         }
     }
 
-    private func scan(_ running: [RunningOffice], frontmostPID: pid_t?, frontmostBundleID: String?) -> OfficeState {
+    private func scan(_ running: [RunningOffice], frontmostPID: pid_t?, frontmostBundleID: String?,
+                      cachedServerSnapshots: [pid_t: ServerSnapshot]) -> ScanResult {
         let livePIDs = Set(running.map(\.processID))
         identities = identities.filter { livePIDs.contains($0.key) }
         previousDocuments = previousDocuments.filter { livePIDs.contains($0.key) }
@@ -554,6 +930,7 @@ final class OfficeWindowMonitor {
         var allDocuments: [OfficeDocument] = []
         var activeDocumentID: String?
         var hasModalWindow = false
+        var serverSnapshots: [pid_t: ServerSnapshot] = [:]
 
         for app in running {
             let application = AXUIElementCreateApplication(app.processID)
@@ -563,6 +940,7 @@ final class OfficeWindowMonitor {
             guard result == .success, let windows = rawWindows as? [AXUIElement] else {
                 // 短暂忙碌不等同于文档已关闭；成功读取窗口列表后才真正移除标签。
                 allDocuments += previousDocuments[app.processID] ?? []
+                serverSnapshots[app.processID] = serverSnapshot(processID: app.processID, cached: cachedServerSnapshots[app.processID])
                 continue
             }
             let focused = Self.element(application, kAXFocusedWindowAttribute as CFString)
@@ -596,7 +974,9 @@ final class OfficeWindowMonitor {
                                               fileURL: info.fileURL, isEdited: Self.bool(window, kAXEditedAttribute as CFString),
                                               isMinimized: Self.bool(window, kAXMinimizedAttribute as CFString),
                                               isFullScreen: isFullScreen, frame: frame,
-                                              geometryTimestamp: geometryTimestamp, element: window)
+                                              geometryTimestamp: geometryTimestamp,
+                                              windowServerID: oldIdentity.flatMap { oldDocuments[$0.id]?.windowServerID },
+                                              element: window)
                 } else if let identity = oldIdentity, let previous = oldDocuments[identity.id] {
                     // Office 正忙时沿用最近完整快照，保持标签身份、顺序和窗口观察器。
                     document = previous
@@ -604,24 +984,52 @@ final class OfficeWindowMonitor {
                     continue
                 }
                 nextIdentities.append(Identity(id: document.id, element: window))
+                let hint = metadataTitlebarHints[document.id]
+                let needsHint = hint == nil || abs((hint?.width ?? 0) - document.frame.width) > 1 ||
+                    hint?.title != document.title || ProcessInfo.processInfo.systemUptime - (hint?.timestamp ?? 0) > 30
+                if needsHint, !pointerIsDown() {
+                    let sampledAt = ProcessInfo.processInfo.systemUptime
+                    metadataTitlebarHints[document.id] = TitlebarHint(width: document.frame.width, title: document.title,
+                        regions: TitlebarDragRegions.capture(window: window, frame: document.frame), timestamp: sampledAt)
+                }
                 appDocuments.append(document)
                 if app.processID == frontmostPID, let focused = focused, CFEqual(focused, window) {
                     activeDocumentID = document.id
                 }
             }
+            let snapshot = serverSnapshot(processID: app.processID, cached: cachedServerSnapshots[app.processID])
+            let serverWindows = snapshot.windows
+            serverSnapshots[app.processID] = snapshot
+            let bindings = WindowServerGeometry.bindings(documents: appDocuments.map {
+                WindowServerDocument(id: $0.id, processID: $0.processID, frame: $0.frame, previousWindowID: $0.windowServerID)
+            }, candidates: serverWindows, focusedDocumentID: activeDocumentID)
+            appDocuments = appDocuments.map { Self.binding($0, to: bindings[$0.id]) }
             identities[app.processID] = nextIdentities
             previousDocuments[app.processID] = appDocuments
             allDocuments += appDocuments
             updateObservation(for: app.processID, application: application, documents: appDocuments)
         }
         let liveIDs = Set(allDocuments.map(\.id))
+        metadataTitlebarHints = metadataTitlebarHints.filter { liveIDs.contains($0.key) }
         documentOrder.removeAll { !liveIDs.contains($0) }
         for document in allDocuments where !documentOrder.contains(document.id) { documentOrder.append(document.id) }
         let positions = Dictionary(uniqueKeysWithValues: documentOrder.enumerated().map { ($0.element, $0.offset) })
         allDocuments.sort { (positions[$0.id] ?? 0) < (positions[$1.id] ?? 0) }
-        return OfficeState(documents: allDocuments, frontmostBundleID: frontmostBundleID,
-                           activeDocumentID: activeDocumentID, hasModalWindow: hasModalWindow,
-                           accessibilityGranted: true)
+        return ScanResult(state: OfficeState(documents: allDocuments, frontmostBundleID: frontmostBundleID,
+                                            activeDocumentID: activeDocumentID, hasModalWindow: hasModalWindow,
+                                            accessibilityGranted: true), serverSnapshots: serverSnapshots,
+                          titlebarHints: metadataTitlebarHints)
+    }
+
+    private func pointerIsDown() -> Bool {
+        Thread.isMainThread ? interactionDown : DispatchQueue.main.sync { self.interactionDown }
+    }
+
+    private func serverSnapshot(processID: pid_t, cached: ServerSnapshot?) -> ServerSnapshot {
+        // 全量枚举只在后台且没有正在拖动时进行，不能争用窗口移动的系统连接。
+        if pointerIsDown() { return cached ?? ServerSnapshot(windows: [], timestamp: 0) }
+        let sampledAt = ProcessInfo.processInfo.systemUptime
+        return ServerSnapshot(windows: WindowServerGeometry.list(processID: processID), timestamp: sampledAt)
     }
 
     private func updateObservation(for pid: pid_t, application: AXUIElement, documents: [OfficeDocument]) {

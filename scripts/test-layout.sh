@@ -8,9 +8,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# 仅编译纯布局代码，Command Line Tools 即可运行，也不会启动标签栏或访问 Office。
+# 只运行布局、身份匹配和拖动预测的纯数据用例，Command Line Tools 即可运行，不枚举真实窗口。
 swiftc -swift-version 5 -parse-as-library \
     "$PROJECT_ROOT/Sources/OfficeTabs/WindowPlacement.swift" \
     "$PROJECT_ROOT/Tests/WindowPlacementTests.swift" \
     -o "$TEST_BUILD_DIR/layout-tests"
 "$TEST_BUILD_DIR/layout-tests"
+
+swiftc -swift-version 5 -parse-as-library \
+    "$PROJECT_ROOT/Sources/OfficeTabs/WindowServerGeometry.swift" \
+    "$PROJECT_ROOT/Tests/WindowServerGeometryTests.swift" \
+    -o "$TEST_BUILD_DIR/window-server-tests"
+"$TEST_BUILD_DIR/window-server-tests"
+
+swiftc -swift-version 5 -parse-as-library \
+    "$PROJECT_ROOT/Sources/OfficeTabs/CursorDragModel.swift" \
+    "$PROJECT_ROOT/Tests/CursorDragModelTests.swift" \
+    -o "$TEST_BUILD_DIR/cursor-drag-tests"
+"$TEST_BUILD_DIR/cursor-drag-tests"

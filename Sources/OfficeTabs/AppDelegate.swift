@@ -27,6 +27,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     private var geometry: [String: GeometrySnapshot] = [:]
     private var geometryChangedAt: [String: TimeInterval] = [:]
+    private var dragPaintFrames: [String: CGRect] = [:]
+    private var pendingEdgeRelease: Set<String> = []
     private var isInteracting = false
     private var interactionEndedAt: TimeInterval = 0
     private var interactionStartedAt: TimeInterval = 0
@@ -40,6 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var interactionGeneration: UInt64 = 0
     private var errorMessage: String?
     private var foregroundObserver: NSObjectProtocol?
+    private var foregroundBundleID: String?
     private var screenObserver: NSObjectProtocol?
     private var visibilityReason = ""
     private let logger = Logger(subsystem: "local.jason.OfficeTabs", category: "window-state")
@@ -65,6 +68,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        foregroundBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         // 保持单实例，防止重复启动后出现多条标签栏和互相争抢的窗口布局。
         let peers = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "local.jason.OfficeTabs")
         if peers.contains(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
@@ -74,8 +78,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         createPanel()
         createStatusItem()
         foregroundObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
-                                                                               object: nil, queue: .main) { [weak self] _ in
+                                                                               object: nil, queue: .main) { [weak self] notification in
             guard let self else { return }
+            let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            self.foregroundBundleID = application?.bundleIdentifier ?? NSWorkspace.shared.frontmostApplication?.bundleIdentifier
             self.interactionGeneration &+= 1
             self.reservationFailures.removeAll()
             self.updateBar()
@@ -86,9 +92,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         monitor.onGeometryChange = { [weak self] id, frame, down, timestamp in
             self?.receiveGeometry(id: id, frame: frame, mouseDown: down, timestamp: timestamp)
         }
+        monitor.onDragFrame = { [weak self] id, frame in
+            guard let self else { return }
+            self.dragPaintFrames[id] = frame
+            if frame == nil { self.pendingEdgeRelease.remove(id) }
+            if let document = self.currentDocument(), document.id == id, self.followsWindow {
+                self.layoutAttached(document)
+            }
+        }
+        monitor.onFocusedDocumentChange = { [weak self] id in
+            guard let self else { return }
+            self.state.activeDocumentID = id
+            self.lastActiveID = id
+            self.updateBar()
+        }
         monitor.onInteractionChange = { [weak self] down in
             guard let self else { return }
             self.recordInteraction(down)
+            if !down, !self.dragPaintFrames.isEmpty {
+                let point = NSEvent.mouseLocation
+                let nearEdge = NSScreen.screens.contains { screen in
+                    let visible = screen.visibleFrame
+                    return visible.insetBy(dx: -24, dy: -24).contains(point) &&
+                        (point.x - visible.minX < 24 || visible.maxX - point.x < 24 || visible.maxY - point.y < 24)
+                }
+                if nearEdge { self.pendingEdgeRelease.formUnion(self.dragPaintFrames.keys) }
+            }
             if let document = self.currentDocument(), self.followsWindow { self.layoutAttached(document) }
         }
         monitor.onError = { [weak self] message in
@@ -202,6 +231,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func receive(_ snapshot: OfficeState) {
         state = snapshot
+        foregroundBundleID = snapshot.frontmostBundleID
         if let active = snapshot.activeDocumentID { lastActiveID = active }
         let existing = Set(snapshot.documents.map(\.id))
         orderedIDs.removeAll { !existing.contains($0) }
@@ -211,6 +241,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         geometry = geometry.filter { existing.contains($0.key) }
         geometryChangedAt = geometryChangedAt.filter { existing.contains($0.key) }
+        dragPaintFrames = dragPaintFrames.filter { existing.contains($0.key) }
+        pendingEdgeRelease.formIntersection(existing)
         reservationFailures = reservationFailures.filter { existing.contains($0.key) }
         lastReservationAttempt = lastReservationAttempt.filter { existing.contains($0.key) }
         if snapshot.accessibilityGranted { errorMessage = nil }
@@ -225,8 +257,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             defaults.set(panel.frame.minY, forKey: "manualY")
         }
         // AX 扫描可能在 Office 忙碌时变慢，显示前以最新前台应用再次核实可见性。
-        let currentFrontBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-        let frontOffice = OfficeApp.matching(currentFrontBundle)
+        let frontOffice = OfficeApp.matching(foregroundBundleID)
         let selectedDocument = currentDocument()
         bar.update(documents: sortedDocuments(), activeID: selectedDocument?.id ?? lastActiveID,
                    filter: filter, themeApp: frontOffice)
@@ -256,7 +287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func currentDocument() -> OfficeDocument? {
-        let frontOffice = OfficeApp.matching(NSWorkspace.shared.frontmostApplication?.bundleIdentifier)
+        let frontOffice = OfficeApp.matching(foregroundBundleID)
         let preferredID = state.activeDocumentID ?? lastActiveID
         let candidates = state.documents.filter { $0.app == frontOffice && !$0.isMinimized }
         return candidates.first { $0.id == preferredID } ?? candidates.first
@@ -267,7 +298,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if isHidden { hidePanel("user-hidden"); return false }
         if state.hasModalWindow { hidePanel("office-dialog"); return false }
         if state.documents.isEmpty { hidePanel("no-documents"); return false }
-        if OfficeApp.matching(NSWorkspace.shared.frontmostApplication?.bundleIdentifier) == nil {
+        if OfficeApp.matching(foregroundBundleID) == nil {
             hidePanel("other-app"); return false
         }
         return true
@@ -290,7 +321,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               recordGeometry(id: id, frame: frame, timestamp: timestamp) else { return }
         recordInteraction(mouseDown)
         guard followsWindow, canPresent(),
-              document.app == OfficeApp.matching(NSWorkspace.shared.frontmostApplication?.bundleIdentifier) else { return }
+              document.app == OfficeApp.matching(foregroundBundleID) else { return }
         if state.activeDocumentID != id {
             state.activeDocumentID = id
             lastActiveID = id
@@ -322,7 +353,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             interactionEndedAt = ProcessInfo.processInfo.systemUptime
             if interactionGeometryUpdates > 0, interactionEndedAt - interactionStartedAt > 0.05 {
-                logger.notice("geometry tracking: \(self.interactionGeometryUpdates) updates in \(Int((self.interactionEndedAt - self.interactionStartedAt) * 1000)) ms")
+                logger.notice("validated geometry: \(self.interactionGeometryUpdates) updates in \(Int((self.interactionEndedAt - self.interactionStartedAt) * 1000)) ms")
             }
         }
     }
@@ -338,8 +369,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func layoutAttached(_ document: OfficeDocument) {
         guard canPresent() else { return }
+        if pendingEdgeRelease.contains(document.id) { hidePanel("awaiting-drag-position"); return }
         let primaryTop = NSScreen.screens.first?.frame.maxY ?? 0
-        let axFrame = geometry[document.id]?.frame ?? document.frame
+        let visualOverride = dragPaintFrames[document.id]
+        let axFrame = visualOverride ?? geometry[document.id]?.frame ?? document.frame
         let frame = NSRect(x: axFrame.minX, y: primaryTop - axFrame.maxY,
                            width: axFrame.width, height: axFrame.height)
         let screen = NSScreen.screens.max { a, b in
@@ -361,7 +394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             showPanel()
         case .needsSpace:
             hidePanel("awaiting-space")
-            scheduleReservation(document, observedFrame: axFrame)
+            if visualOverride == nil { scheduleReservation(document, observedFrame: axFrame) }
         case .unavailable:
             hidePanel(document.isFullScreen ? "full-screen" : "invalid-frame")
         }
@@ -463,7 +496,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func showAbout() {
         let alert = NSAlert()
-        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.1"
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.2"
         alert.messageText = "Office Tabs \(version)"
         alert.informativeText = "为 Word、Excel 和 PowerPoint 提供文档标签切换。\n\n本机运行 · Swift / AppKit · MIT 许可\n通过 macOS 辅助功能读取窗口标题、路径和状态。"
         alert.addButton(withTitle: "好")
